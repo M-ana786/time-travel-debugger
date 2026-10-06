@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <cstdint>
 #include <cstdio>
+#include <stdexcept>
 using namespace std;
 
 // ---- Constants ----
@@ -47,31 +48,72 @@ class Stack
 public:
     // Implement these functions:
     Stack()
-    { // initialize the stack
+    { 
+        top = nullptr;
+        count =0;
     }
     void push(const T &val)
     {
 
-        // pushes the value on the stack if max limit is not reached yet.
+        if (count == MAX_STACK_DEPTH){
+           throw underflow_error("Empty stack");
+        }
+
+        Node* insertion_node = new Node();
+        insertion_node->data = val;
+        insertion_node->next = top;
+        top = insertion_node;
+        count++;
+       
     }
     T pop()
     {
-        // pop the top value on the stack
+       
+      if(count == 0 || top == nullptr ){
+        throw underflow_error("Empty stack");
+      }
+
+       Node* to_be_deleted = top;
+       T val = top->data;
+       top = top->next;
+       delete to_be_deleted;
+       count--;
+       return val;
+
+
+
     }
     T &peek()
     {
-        // returns the top value on the stack
+        if(count == 0 || top == nullptr ){
+          throw underflow_error("Empty stack");
+        }
+
+        return top->data;
     }
     bool isEmpty()
     {
+        return count == 0;
     }
     int32_t depth()
     {
+        return count;
     }
     int32_t snapshot_into(T out[], int32_t maxLen)
     {
         // copies every frame, top to bottom in the array given as a parameter
         // this is what buildSnapshot() call, returns count written
+
+        int32_t  indx = 0;
+        Node* c_n = top; // current node 
+
+        while(c_n != nullptr && indx < maxLen){
+            out[indx] = c_n -> data;
+            c_n = c_n->next;
+            indx++;
+        }
+
+        return indx;
     }
 };
 
@@ -92,17 +134,42 @@ class Timeline
 public:
     // Implement these functions
     Timeline()
-    {
+    { 
+        head = tail = nullptr;
+        stepCount = 0;
     }
+
+    ~Timeline();
+
     void record(Snapshot *s)
     {
         // add record in the timeline
+        TimelineNode* new_node = new TimelineNode();
+        new_node->data = s;
+        new_node->next = nullptr;
+        new_node->prev = tail;
+        
+        if (head == nullptr){
+            head = tail = new_node;
+        }else{
+            tail->next = new_node;
+            tail = new_node;
+        }
+
+        stepCount++;
+
     }
     TimelineNode *begin()
     {
+        if(stepCount == 0 || head == nullptr){
+            throw underflow_error("Empty Timeline");
+        }
+
+        return head;
     }
     int32_t getStepCount()
     {
+        return stepCount;
     }
 };
 
@@ -126,6 +193,18 @@ struct Snapshot
     Frame callStack[MAX_STACK_DEPTH];
     int32_t stackDepth;
 };
+
+Timeline::~Timeline(){
+    TimelineNode* c_n = head;
+    while(c_n != nullptr){
+      TimelineNode* n = c_n->next;
+      delete c_n -> data;
+      delete c_n;
+      c_n = n;
+
+    }
+}
+
 struct TTDBHeader
 {
     char magic[4]; // "TTDB"
@@ -156,9 +235,38 @@ struct PendingPatch
 
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
+
+bool is_space(char ch){
+   
+    if (ch == ' ' || ch == '\t' || ch == '\r' ){
+        return true;
+    }
+    return false;
+}
+
 bool readSourceLine(ifstream &in, string &out)
 {
     // reads the next nonblank line
+
+    string line;
+    while(getline(in , line)){
+        
+        int line_length  = line.length();
+        int indx =0;
+      
+        while(indx < line_length && is_space(line[indx])){
+            indx++;
+        }
+        
+        if(indx < line_length){
+          
+            out = line;
+            return true;
+         
+        }
+    } 
+
+    return false;
 }
 string firstWord(const string &line)
 {
