@@ -9,6 +9,15 @@
 - I implemented Timeline[doubly linked list of snapshots]: (functions of  Timeline)
 - I implemented readSourceLine [along with helper function is_space ] 
 
-### Next day 
+## Next time
 - I will implement 0x0 :firstWord , secondWord , validateProgram
 - I will implement 0x1 : writeResolveRecord 
+
+### 7 October 2026
+- I implemented 0x0 : firstWord , secondWord , validateProgram
+- I understood binary files 
+- I implemented 0X1 : writeResolveRecord , readResolveRecord , validateProgram
+
+## Next time 
+- I will implement tokenizeLine , buildSnapshot , executeProgram
+

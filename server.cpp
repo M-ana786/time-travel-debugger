@@ -56,7 +56,7 @@ public:
     {
 
         if (count == MAX_STACK_DEPTH){
-           throw underflow_error("Empty stack");
+           throw overflow_error("Stack is full");
         }
 
         Node* insertion_node = new Node();
@@ -268,17 +268,99 @@ bool readSourceLine(ifstream &in, string &out)
 
     return false;
 }
+
+
 string firstWord(const string &line)
 {
-    // returns first word from the input string
+    string first_word;
+    int indx =0;
+    int len = line.length();
+
+    
+        
+    while (indx < len && is_space(line[indx])){
+          
+        indx++; 
+    }
+
+    while(indx < len && !is_space(line[indx])){
+          
+        first_word = first_word + line[indx];
+        indx++; 
+    }
+    return first_word;
+
 }
 string secondWord(const string &line)
 {
-    // returns the second word
+    string second_word;
+    int indx =0;
+    int len = line.length();
+
+  
+    while(indx < len && is_space(line[indx])){
+           
+        indx++; 
+    }
+
+    while(indx < len && !is_space(line[indx])){
+        
+        indx++; 
+    }
+       
+       
+    while (indx < len && is_space(line[indx])){
+            
+        indx++; 
+    }
+
+    while(indx < len && !is_space(line[indx])){
+
+        second_word = second_word + line[indx];
+        indx++;  
+    }
+
+    return second_word;
 }
 bool validateProgram(const char *sourcePath)
 {
     // for each func defined there should be exactly one func_end and no nested funcs allowed - 
+
+    ifstream fin(sourcePath);
+    if(!fin){
+        cout << "Error!!!!  Couldn't open the file " << endl;
+        return false;
+    } 
+
+    string Line;
+    bool inside = false ;
+    while (readSourceLine(fin ,Line)){
+
+       
+        string word =  firstWord(Line);
+       
+        
+        if(word == "func"){
+            if(inside == true){
+                return false;
+            }else{
+                inside = true;
+            }
+        }
+        else if(word == "func_end"){
+           
+            if(!inside){
+                return false;
+            }else{
+                inside = false;
+            }
+        }
+
+
+
+    }
+
+    return !inside;
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
@@ -286,10 +368,36 @@ int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
 {
     // writes one [offset(8B)][size(4B)][string] record at the current file position
     // returns this record's own starting byte position
+
+
+    int64_t record_start = ftell(f); // this gives current position of file 
+    fwrite(&offsetField, sizeof(int64_t),1 , f); // storing value of offset field using 8 bytes
+    
+    int32_t string_size = static_cast<int32_t>(text.size());
+    fwrite(&string_size , sizeof(int32_t),1,f);
+
+    fwrite(text.data(), 1, text.size(), f);
+
+
+   return record_start;
 }
 int64_t readResolveRecord(FILE *f, string &outText)
 {
     // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
+   int64_t offset_field;
+   if (fread(&offset_field, sizeof(int64_t), 1, f) != 1){
+        return -1;
+   }
+
+   int32_t string_size;
+   if (fread(&string_size , sizeof(int32_t),1 , f)!= 1){
+        return -1;
+   }
+
+   outText.resize(string_size);
+   fread(&outText[0] , 1, string_size, f);
+
+   return offset_field;
 }
 int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 {
@@ -304,7 +412,113 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     // Once the whole file is written, every CALL's offset field is patched
     // with its target's position. Patching happens after the full write
     // Returns the byte offset of main's FUNC header record.
-    // if there is no main return the error 
+    // if there is no main return the error
+    
+    ifstream fin(sourcePath);
+    FILE* f = fopen(resolveBinPath,"wb");
+
+    if(!fin || f == nullptr){
+
+        if(f != nullptr){
+            fclose(f);
+        }
+        cout << " File couldn't be opened "<<endl;
+        return -1;
+    }
+    string Line;
+    while(readSourceLine(fin ,Line )){
+        
+        int64_t offset_field = ftell(f);
+        int64_t r_st_p = writeResolveRecord(f,offset_field,Line); // r_st_p is records starting point 
+
+        string word = firstWord(Line);
+        
+        if (word == "func"){
+
+            if(funcCount >= MAX_FUNCS){
+                cout << "Too many functions"<<endl;
+                fclose(f);
+                return -1;
+            }
+            
+            string func_name = secondWord(Line);
+
+            if(func_name == ""){
+                cout << "Function has no name"<<endl;
+                fclose(f);
+                return -1;
+            }
+
+            funcArray[funcCount].funcName   = func_name;
+            funcArray[funcCount].byteOffsetInResolveBin = r_st_p;
+            funcCount++;
+        }else if (word == "call"){
+            
+            if (patchCount >= MAX_PATCHES){
+
+                cout << " Too many calls "<< endl;
+                fclose(f);
+                return -1;
+
+            }
+
+            string func_name = secondWord(Line);
+            
+            if(func_name == ""){
+                cout << "Function has no name"<<endl;
+                fclose(f);
+                return -1;
+            }
+            patches[patchCount].targetFuncName = func_name;
+            patches[patchCount].byteOffsetOfOffsetField = r_st_p;
+            patchCount++;
+        }
+       
+    }
+
+    for(int32_t i =0; i < patchCount ; i++){
+        
+        string tar_func = patches[i].targetFuncName;
+        bool found = false;
+
+        for(int32_t j =0; j < funcCount;j++){
+        
+            if(tar_func == funcArray[j].funcName){
+
+              int64_t offset_field = patches[i].byteOffsetOfOffsetField;
+              fseek(f,offset_field,SEEK_SET);
+              
+              int64_t target_offset = funcArray[j].byteOffsetInResolveBin;
+              fwrite(&target_offset, sizeof(int64_t),1,f);
+
+              found = true;
+              break;
+
+            }
+        }
+
+        if(!found){
+
+            cout << "Error!!!! call to undefined function" << tar_func << endl;
+            fclose(f);
+            return -1;
+        }
+
+    }
+
+    fclose(f);
+
+    for (int32_t j =0; j<funcCount;j++){
+        if(funcArray[j].funcName == "main"){
+            return funcArray[j].byteOffsetInResolveBin;
+            
+        }
+    }
+
+    cout << "Error!!! no main function "<<endl;
+    fin.close();
+    return -1;
+
 }
 
 // PASS 0x2: EXECUTION (tokenization happens here)
@@ -350,6 +564,7 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
     // update the header
 }
 // main section
+
 int32_t main()
 {
 
@@ -361,6 +576,10 @@ int32_t main()
 
     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
 
+    if (mainOffset == -1){
+        // throw error 
+        return 1;
+    }
     Timeline timeline;
     executeProgram("resolve.bin", mainOffset, timeline);
 
