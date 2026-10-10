@@ -21,3 +21,9 @@
 ## Next time 
 - I will implement tokenizeLine , buildSnapshot , executeProgram
 
+### 10 October 2026
+- I implemented tokenizeLine , buildSnapshot 
+- I wrote some helper functions and execute program
+
+## Next time 
+- I will implement stage 0x3 
