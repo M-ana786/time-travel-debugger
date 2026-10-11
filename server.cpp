@@ -212,14 +212,29 @@ struct TTDBHeader
     int32_t stepCount;
     int64_t indexOffset;
 };
-void writeHeader(FILE *f, const TTDBHeader &h)
-{
-    fwrite(h.magic, 1, 4, f);
-    fwrite(&h.version, sizeof(int32_t), 1, f);
+void writeHeader(FILE* f , const TTDBHeader& h){
 
-    // placeholder for other two data members
+    if(fwrite(h.magic ,1,4,f) != 4){
+
+        throw runtime_error("Failed to write TTDB magic ");
+    } 
+
+    if(fwrite(&h.version , sizeof(int32_t) ,1, f)!= 1){
+
+        throw runtime_error("Failed to write TTDB version ");
+    } 
+    
+    if(fwrite(&h.stepCount , sizeof(int32_t) ,1,f)!= 1){
+
+       throw runtime_error("Failed to write TTDB step count ");
+    } 
+    
+    if(fwrite(&h.indexOffset , sizeof(int64_t) ,1,f) != 1){
+
+        throw runtime_error("Failed to write TTDB index offset ");
+    } 
+    
 }
-
 // resolve.bin - bookkeeping
 struct FuncEntry
 {
@@ -388,7 +403,7 @@ int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
     int32_t string_size = static_cast<int32_t>(text.size());
     if(fwrite(&string_size , sizeof(int32_t),1,f)!= 1){
 
-        cout << "Error writing offset field" << endl;
+        cout << "Error writing string size" << endl;
         return -1;
 
 
@@ -560,7 +575,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 
         if(!found){
 
-            cout << "Error!!!! call to undefined function" << tar_func << endl;
+            cout << "Error!!!! call to undefined function " << tar_func << endl;
             fclose(f);
             return -1;
         }
@@ -1119,6 +1134,127 @@ void showing_timeline(Timeline& t){
 }
 
 // PASS 0x3: SERIALIZE TIMELINE
+
+bool write_str(FILE* f , const string& str){
+
+    int32_t len = static_cast<int32_t>(str.size());
+
+    if(fwrite(&len , sizeof(int32_t) , 1,f)!= 1){
+
+       cout << "Error!!! while writing " << endl;
+        return false;
+    }
+
+    if(len > 0 && fwrite(str.data(), 1,len ,f)!= static_cast<size_t>(len)){
+
+        cout << "Error!!! while writing "<< endl;
+        return false;
+    }
+
+    return true;
+}
+
+bool write_variable(FILE* f , const Variable& var){
+
+    if(!write_str(f , var.name)){
+        return false;
+    }
+
+    if (fwrite(&var.value ,sizeof(int32_t) ,1,f) != 1){
+        return false;
+    }
+
+    return true;
+
+}
+
+
+bool write_frame(FILE* f , const Frame& frame){
+
+    if (frame.argc < 0 || frame.argc > MAX_VARS_PER_FRAME){
+
+        cout << "Error!!! ";
+        return false;
+    }
+
+    if(frame.localCount <  0 || frame.localCount > MAX_VARS_PER_FRAME){
+
+        cout << "Error!!! ";
+        return false;
+    }
+
+    if(!write_str(f,frame.func_name)){
+
+        cout << "Error!!! Problem while writing " << endl;
+        return false;
+    }
+
+    if(fwrite(&frame.argc , sizeof(int32_t) , 1, f) != 1){
+
+        cout << "Error!!! Problem while writing " << endl;
+        return false; 
+    }
+
+    for(int32_t i = 0; i < frame.argc; i++){
+        if(!write_variable(f, frame.argv[i])){
+
+            cout << "Error!!! Problem while writing " << endl;
+            return false;
+        }
+    }
+
+    if(fwrite(&frame.returnLine , sizeof(int32_t) ,1,f)!= 1){
+
+        cout << "Error!!! couldn't write in file "<<endl;
+        return false;
+    }
+
+    if(fwrite(&frame.localCount , sizeof(int32_t) ,1,f)!= 1){
+
+        cout << "Error!!! couldn't write in file "<<endl;
+        return false;
+    }
+
+    for(int32_t i =0; i < frame.localCount; i++){
+        if(!write_variable(f, frame.locals[i])){
+
+            cout << "Error!!! couldn't write in file "<<endl;
+            return false;
+        }
+    }
+
+    return true;
+
+}
+
+
+bool write_snapshot(FILE* f , const Snapshot& snapshot){
+
+    if(snapshot.stackDepth < 0 || snapshot.stackDepth > MAX_STACK_DEPTH){
+
+        cout << "Error!!! "<<endl;
+        return false;
+    }
+
+    if(fwrite(&snapshot.stackDepth, sizeof(int32_t),1,f)!= 1){
+
+        cout<< "Error!!! Problem while writing "<<endl;
+        return false;
+    }
+
+    for(int32_t i = 0 ; i < snapshot.stackDepth; i++){
+        if(!write_frame(f , snapshot.callStack[i])){
+
+            cout << "Error!!! Problem while writing "<<endl;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+
 void writeTdbg(Timeline &timeline, const char *tdbgPath)
 {
     // placeholder for header
@@ -1126,6 +1262,112 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
     // placing each snapshot in the file while maintaining the index(starting point of each nth snapshot)
     // after timeline add the index array i the file
     // update the header
+
+    FILE* f = fopen(tdbgPath ,"wb");
+
+    if(f == nullptr){
+
+        cout << "Error!!! Couldn't open the file "<< endl;
+        return;
+    }
+
+    int32_t stepCount = timeline.getStepCount();
+
+    int64_t* indx = nullptr;
+
+    if(stepCount > 0){
+
+        indx = new int64_t[stepCount];
+    }
+
+    try{
+
+        TTDBHeader header;
+
+        header.magic[0] = 'T';
+        header.magic[1] = 'T';
+        header.magic[2] = 'D';
+        header.magic[3] = 'B';
+
+        header.version = 1;
+        header.stepCount = stepCount;
+        header.indexOffset = 0;
+
+        writeHeader(f , header);
+
+        TimelineNode* current = nullptr;
+
+        if(stepCount > 0){
+
+            current = timeline.begin();
+        }
+
+        int32_t step = 0;
+
+        while(current != nullptr && step < stepCount){
+
+            long position = ftell(f);
+
+            if(position == -1){
+                throw runtime_error("Couldn't determine snapshot file offset ");
+            }
+
+            indx[step] = static_cast<int64_t>(position);
+
+            if(current->data == nullptr || !write_snapshot(f , *current->data)){
+
+                throw runtime_error("Failed to write snapshot");
+            }
+
+            current = current->next;
+            step++;
+        }
+
+        if(step != stepCount){
+
+            throw runtime_error("Timeline node count doesn't match step count ");
+        }
+
+        long indx_position = ftell(f);
+
+        if(indx_position == -1){
+
+            throw runtime_error("Couldn't determine index offset ");
+        }
+
+        header.indexOffset = static_cast<int64_t>(indx_position);
+
+        for (int32_t i = 0; i < stepCount ;i++ ){
+            
+            if(fwrite(&indx[i] , sizeof(int64_t),1,f)!= 1){
+
+                throw runtime_error("Failed to write dense index ");
+            }
+
+        }
+
+        if(fseek(f ,0 , SEEK_SET) != 0){
+
+            throw runtime_error("Couldn't seek to header ");
+        }
+
+        writeHeader(f , header);
+
+        if(ferror(f)){
+            throw runtime_error("File write error");
+        }
+
+        cout << "Successfully created " << tdbgPath << endl;
+       
+    }
+    catch(const exception& e){
+        
+        cout << "Error!!! Serialization failed: " << e.what() << endl;
+    }
+
+   delete[] indx;
+   fclose(f);
+
 }
 // main section
 
@@ -1134,8 +1376,8 @@ int32_t main()
 
     if (!validateProgram("source.bin"))
     {
-        // send an error response instead of a .tdbg file
-        return 1;
+                 // send an error response instead of a .tdbg file
+       return 1;
     }
 
     int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
@@ -1144,10 +1386,11 @@ int32_t main()
         // throw error 
         return 1;
     }
-    Timeline timeline;
+   Timeline timeline;
     executeProgram("resolve.bin", mainOffset, timeline);
 
     writeTdbg(timeline, "session.tdbg");
 
     return 0;
 }
+

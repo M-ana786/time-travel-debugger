@@ -27,3 +27,8 @@
 
 ## Next time 
 - I will implement stage 0x3 
+
+### 11 October 2026
+
+- I implemented stage 0x3 completely today 
+
