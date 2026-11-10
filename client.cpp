@@ -39,7 +39,7 @@ const int MAX_NAME_LENGTH = 4096; // longest name accepted when reading.tdbg
 const size_t MAX_ERROR_SIZE = 4096;
 const int64_t TDBG_HEADER_SIZE = 20 ; // 4+4+4+8 bytes 
 
-string LB_HOST = "127.0.0.0";
+string LB_HOST = "127.0.0.1";
 int LB_PORT = 5000;
 
 
@@ -230,7 +230,7 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
                 tokeep = remaining;
             }
 
-            outError.append(body.data() , released);
+            outError.append(body.data() , tokeep);
         }
         
     }
@@ -265,7 +265,7 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
         return false;
     }
 
-    return true;
+    return true;git add helper.h server.cpp client.cpp load_balancer.cpp
 
 }
 bool requestDebugFile(const string &host , int port , const string &sourcePath , const char *outTdbgPath , string &outError){
@@ -300,9 +300,19 @@ bool requestDebugFile(const string &host , int port , const string &sourcePath ,
 
     if(!uploadSource(sock , sourcePath.c_str())){
 
-        
-        outError = "upload to the load balancer failed";
+        string lbError;
+        bool gotFile = receiveResponse(sock , outTdbgPath , lbError);
         close(sock);
+
+        if(gotFile){
+            remove(outTdbgPath);
+        }
+
+        if(!gotFile && !lbError.empty()){
+            outError = lbError;
+        }else{
+            outError = "upload to the load balancer failed";
+        }
         return false;
     }
 
@@ -319,6 +329,7 @@ bool requestDebugFile(const string &host , int port , const string &sourcePath ,
 // The index lets us jump straight to any step without reading the steps before it.
 // =============================================================================================
 
+void closeTdbg(TdbgReader &r);
 bool openTdbg(const char *path, TdbgReader &r)
 {
    const int32_t supportedVersion = 1;
@@ -342,8 +353,7 @@ bool openTdbg(const char *path, TdbgReader &r)
 
     TTDBHeader  &h = r.header;
 
-    bool ok = fread(h.magic , 1, 4, r.fp) == 4 && fread(&h.version , sizeof(h.version) , 1 , r.fp) == 1 &&
-              fread(&h.stepCount , sizeof(h.stepCount) ,1 ,r.fp) == 1 && fread(&h.indexOffset , sizeof(h.indexOffset) , 1, r.fp) == 1;
+    bool ok = fread(h.magic , 1, 4, r.fp) == 4 && fread(&h.version , sizeof(h.version) , 1 , r.fp) == 1 && fread(&h.stepCount , sizeof(h.stepCount) ,1 ,r.fp) == 1 && fread(&h.indexOffset , sizeof(h.indexOffset) , 1, r.fp) == 1;
 
 
     if (!ok){
@@ -482,7 +492,7 @@ bool readFrame(FILE* f, Frame &fr){
 Snapshot *readSnapshotAt(TdbgReader &r, int32_t step)
 {
 
-    if(r.fp == nullptr || step < 0 || step > r.header.stepCount){
+    if(r.fp == nullptr || step < 0 || step >= r.header.stepCount){
         return nullptr;
     }
 
@@ -668,6 +678,7 @@ bool cmdStart(DebugSession &s, const string &sourcePath)
     return showCurrent(s);
 
 }
+
 bool cmdNext(DebugSession &s) {
 
     return moveBy(s , 1);
@@ -752,10 +763,10 @@ void printHelp()
     
     cout << "                                        Commands:                            " << endl;
     cout << " start <file>            send a source filr to the server and open the result "<< endl;
-    cout << " next                    go one step back "<< endl;
+    cout << " next                    go one step forward "<< endl;
     cout << " prv                     go one step back "<<endl;
-    cout << " jump next <n>           jump n steps forwrd "<< endl;
-    cout << " jump prv <n>            jump n steps back "<<endl;
+    cout << " jmp next <n>           jump n steps forward "<< endl;
+    cout << " jmp prv <n>            jump n steps back "<<endl;
     cout << " help                    show this list "<< endl;
     cout << " quit                    leave the debugger "<< endl;
 
@@ -841,7 +852,7 @@ bool runCommand(DebugSession &s, const string &line, bool &quitRequested)
         printHelp();
         return true;
     }
-    else if ((cmd == "quit " || cmd == "exit" ) && words.size() == 1){
+    else if ((cmd == "quit" || cmd == "exit" ) && words.size() == 1){
         quitRequested = true;
         return true;
     }

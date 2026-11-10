@@ -32,3 +32,16 @@
 
 - I implemented stage 0x3 completely today 
 
+
+### 9 November 2026
+- I implemented the functions of helper header file
+- I implemented some functions of the client file
+
+### 10 November 2026
+- I implemented rest functions of the client file
+
+### 11 November 2026
+- I implemented load_balancer and did changes to server cpp 
+
+
+

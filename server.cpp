@@ -16,10 +16,16 @@
 #include <fstream>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <cstdint>
 #include <cstdio>
 #include <stdexcept>
 #include "helper.h"
+#include <csignal>      
+#include <cerrno>      
+#include <cstdlib>      
+#include <vector>        
+#include <sys/time.h>    
+#include <netinet/in.h> 
+#include <arpa/inet.h>   
 using namespace std;
 
 // ---- Constants ----
@@ -29,7 +35,9 @@ const int32_t MAX_TOKENS = MAX_VARS_PER_FRAME + 2; // kW + func_name + upto 16 p
 const int32_t MAX_PATCHES = MAX_FUNCS * 4;
 const uint64_t MAX_SOURCE_BYTES = 15ULL * 1024 * 1024; // sanity cap on the declared file length
 const int32_t SOCKET_TIMEOUT_SEC = 5;                      // TODO: apply as SO_RCVTIMEO so a deadclient can't hang the server forever
-
+const int32_t MAX_STEPS = 2000;                         //  a Snapshot is ~85 KB in RAM and there are no loops, but calls can fan out exponentially
+const int SERVER_BACKLOG = 16;                        
+const int DEFAULT_PORT = 5001;    
 // ---- Custom data structures
 
 // Stack: back the live Call Stack during execution
@@ -51,6 +59,16 @@ public:
         top = nullptr;
         count =0;
     }
+
+    ~Stack(){
+
+    while(top != nullptr){
+
+        Node* temp = top;
+        top = top->next;
+        delete temp;
+    }
+}
     void push(const T &val)
     {
 
@@ -78,8 +96,6 @@ public:
        delete to_be_deleted;
        count--;
        return val;
-
-
 
     }
     T &peek()
@@ -212,7 +228,7 @@ void writeHeader(FILE* f , const TTDBHeader& h){
 }
 
 // PASS 0x0: READING source.bin + VALIDITY CHECK
-
+bool is_num(const string& str);
 bool is_space(char ch){
    
     if (ch == ' ' || ch == '\t' || ch == '\r' ){
@@ -299,45 +315,241 @@ string secondWord(const string &line)
 
     return second_word;
 }
-bool validateProgram(const char *sourcePath)
+
+bool validateProgram(const char *sourcePath, string &err)
 {
-    // for each func defined there should be exactly one func_end and no nested funcs allowed - 
-
     ifstream fin(sourcePath);
+
     if(!fin){
-        cout << "Error!!!!  Couldn't open the file " << endl;
+
+        err = "server couldn't open source.bin";
         return false;
-    } 
-
-    string Line;
-    bool inside = false ;
-    while (readSourceLine(fin ,Line)){
-
-       
-        string word =  firstWord(Line);
-       
-        
-        if(word == "func"){
-            if(inside == true){
-                return false;
-            }else{
-                inside = true;
-            }
-        }
-        else if(word == "func_end"){
-           
-            if(!inside){
-                return false;
-            }else{
-                inside = false;
-            }
-        }
-
-
-
     }
 
-    return !inside;
+    string Line;
+    bool inside = false;
+
+    string functionNames[MAX_FUNCS];
+    int32_t functionCount = 0;
+
+    while(readSourceLine(fin, Line)){
+
+        if(Line.size() > static_cast<size_t>(MAX_NAME_LENGTH)){
+            err = "line too long (max " + to_string(MAX_NAME_LENGTH) + " characters)";
+            return false;
+        }
+
+        string word = firstWord(Line);
+        string name = secondWord(Line);
+
+        // Count the total number of words
+        int32_t wordCount = 0;
+        bool inWord = false;
+
+        for(int32_t i = 0; i < static_cast<int32_t>(Line.size()); i++){
+
+            if(!is_space(Line[i])){
+
+                if(!inWord)
+                {
+                    wordCount++;
+                    inWord = true;
+                }
+            }else{
+
+                inWord = false;
+            }
+        }
+
+        if(word == "func"){
+
+            if(inside){
+
+                err = "nested function declaration: " + Line;
+                return false;
+            }
+
+            if(name == "" || is_num(name)){
+
+                err = "invalid function name: " + Line;
+                return false;
+            }
+
+            if(wordCount - 2 > MAX_VARS_PER_FRAME){
+
+                err = "too many function parameters: " + Line;
+                return false;
+            }
+
+            if(functionCount >= MAX_FUNCS){
+
+                err = "too many functions";
+                return false;
+            }
+
+            for(int32_t i = 0; i < functionCount; i++){
+
+                if(functionNames[i] == name){
+
+                    err = "duplicate function definition: " + name;
+                    return false;
+                }
+            }
+
+            functionNames[functionCount++] = name;
+
+           
+            string param;
+            int32_t indx = 0;
+
+            while(indx < static_cast<int32_t>(Line.size()) && !is_space(Line[indx])){
+               
+                indx++;
+            }
+
+            while(indx < static_cast<int32_t>(Line.size())){
+
+                while(indx < static_cast<int32_t>(Line.size()) &&  is_space(Line[indx])){
+
+                    indx++;
+                }
+
+                if(indx >= static_cast<int32_t>(Line.size()))
+                    break;
+
+                param = "";
+
+                while(indx < static_cast<int32_t>(Line.size()) && !is_space(Line[indx])){
+
+                    param += Line[indx++];
+                }
+
+                if(param == name)
+                    continue;
+
+                if(is_num(param)){
+
+                    err = "numeric parameter name is invalid: " + Line;
+                    return false;
+                }
+
+                int32_t check = 0;
+                int32_t earlierCount = 0;
+
+                while(check < static_cast<int32_t>(Line.size())){
+
+                    while(check < static_cast<int32_t>(Line.size()) && is_space(Line[check])){
+
+                        check++;
+                    }
+
+                    string previous = "";
+
+                    while(check < static_cast<int32_t>(Line.size()) && !is_space(Line[check])){
+
+                        previous += Line[check++];
+                    }
+
+                    if(previous == param)
+                        earlierCount++;
+
+
+                    if(earlierCount > 1){
+
+                        err = "duplicate parameter name: " + param;
+                        return false;
+                    }
+                }
+            }
+
+            inside = true;
+        }
+        else if(word == "func_end"){
+
+            if(wordCount != 1){
+
+                err = "func_end must not have operands: " + Line;
+                return false;
+            }
+
+            if(!inside){
+
+                err = "func_end without a matching func";
+                return false;
+            }
+
+            inside = false;
+        }else{
+
+            if(!inside){
+
+                err = "instruction outside a function: " + Line;
+                return false;
+            }
+
+            if(word == "call"){
+
+                if(wordCount < 2 || wordCount > MAX_VARS_PER_FRAME + 2){
+
+                    err = "invalid call instruction: " + Line;
+                    return false;
+                }
+
+                if(is_num(name)){
+
+                    err = "invalid function name in call: " + Line;
+                    return false;
+                }
+            }
+            else if(word == "set"){
+
+                if(wordCount != 3){
+
+                    err = "set requires exactly 2 operands: " + Line;
+                    return false;
+                }
+
+                if(is_num(name)){
+
+                    err = "invalid variable name: " + Line;
+                    return false;
+                }
+            }
+            else if(word == "add" || word == "sub" || word == "mul" || word == "div"){
+             
+                if(wordCount != 3){
+
+                    err = word + " requires exactly 2 operands: " + Line;
+                    return false;
+                }
+
+                if(is_num(name)){
+
+                    err = "invalid variable name: " + Line;
+                    return false;
+                }
+
+            }else{
+
+                err = "unknown instruction: " + Line;
+                return false;
+            }
+        }
+    }
+
+    if(fin.bad()){
+
+        err = "error while reading source.bin";
+        return false;
+    }
+
+    if(inside){
+
+        err = "func without a matching func_end";
+        return false;
+    }
+
+    return true;
 }
 
 // PASS 0x1: RESOLVE() -> resolve.bin
@@ -367,8 +579,6 @@ int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
 
         cout << "Error writing string size" << endl;
         return -1;
-
-
     }
 
     if(fwrite(text.data(), 1, text.size(), f) != text.size()){
@@ -381,36 +591,43 @@ int64_t writeResolveRecord(FILE *f, int64_t offsetField, const string &text)
    return record_start;
 }
 
-int64_t readResolveRecord(FILE *f, string &outText){
-    // reads one record at the current position and advances past it, returns the offset field - the raw line text comes back untouched in outText.
-   int64_t offset_field;
-    if (fread(&offset_field, sizeof(int64_t), 1, f) != 1){
+int64_t readResolveRecord(FILE *f, string &outText)
+{
+    int64_t offset_field;
+
+    if(fread(&offset_field, sizeof(int64_t), 1, f) != 1){
+
         return -1;
     }
 
     int32_t string_size;
-    if (fread(&string_size , sizeof(int32_t),1 , f)!= 1){
+
+    if(fread(&string_size, sizeof(int32_t), 1, f) != 1){
+
         return -1;
     }
 
-    if(string_size < 0){
-
-        cout << "Invalid string size" << endl;
-        return -1;
+    if(string_size < 0 || static_cast<uint64_t>(string_size) > MAX_SOURCE_BYTES){
       
+        return -1;
     }
 
     outText.resize(string_size);
+
     if(string_size > 0){
-        if(fread(&outText[0] , 1, string_size, f)!= static_cast<size_t>(string_size)){
-            
-            cout << "Error reading string "<<endl;
-            return -1; 
+
+        if(fread(&outText[0], 1, string_size, f) != static_cast<size_t>(string_size)){
+
+            return -1;
         }
     }
-   return offset_field;
+
+    return offset_field;
 }
-int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
+
+
+
+int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath , string &err)
 {
     FuncEntry funcArray[MAX_FUNCS];
     int32_t funcCount = 0;
@@ -431,18 +648,21 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
     if(!fin || f == nullptr){
 
         if(f != nullptr){
+            
             fclose(f);
         }
-        cout << " File couldn't be opened "<<endl;
+
+        err = "server couldn't open source.bin / resolve.bin";
         return -1;
     }
+
     string Line;
     while(readSourceLine(fin ,Line )){
         
         int64_t offset_field = ftell(f);
         if(offset_field == -1){
 
-            cout << "Error!!! getting file position" << endl;
+            err = "internal error: ftell failed on resolve.bin";
             fclose(f);
             return -1;
         }
@@ -451,7 +671,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
         int64_t r_st_p = writeResolveRecord(f,offset_field,Line); // r_st_p is records starting point 
          if(r_st_p == -1){
 
-            cout << "Error!!! couldn't write file " << endl;
+            err = "internal error: couldn't write resolve.bin";
             fclose(f);
             return -1;
         }
@@ -462,7 +682,8 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
         if (word == "func"){
 
             if(funcCount >= MAX_FUNCS){
-                cout << "Too many functions"<<endl;
+
+                err = "too many functions (max " + to_string(MAX_FUNCS) + ")";
                 fclose(f);
                 return -1;
             }
@@ -470,7 +691,8 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
             string func_name = secondWord(Line);
 
             if(func_name == ""){
-                cout << "Function has no name"<<endl;
+
+                err = "func declaration without a name";
                 fclose(f);
                 return -1;
             }
@@ -482,7 +704,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
             
             if (patchCount >= MAX_PATCHES){
 
-                cout << " Too many calls "<< endl;
+                err = "too many call instructions (max " + to_string(MAX_PATCHES) + ")";
                 fclose(f);
                 return -1;
 
@@ -490,16 +712,23 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
 
             string func_name = secondWord(Line);
             
-            if(func_name == ""){
-                cout << "Function has no name"<<endl;
+                        if(func_name == ""){
+                err = "call instruction without a function name";
                 fclose(f);
                 return -1;
             }
+
             patches[patchCount].targetFuncName = func_name;
             patches[patchCount].byteOffsetOfOffsetField = r_st_p;
             patchCount++;
         }
        
+    }
+
+    if(fin.bad()){
+        err = "error while reading source.bin";
+        fclose(f);
+        return -1;
     }
 
     for(int32_t i =0; i < patchCount ; i++){
@@ -514,7 +743,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
                 int64_t offset_field = patches[i].byteOffsetOfOffsetField;
                 if (fseek(f,offset_field,SEEK_SET) != 0){
 
-                    cout << "Error!!! seeking to Call offset field "<<endl;
+                    err = "internal error: seeking to a call offset field";
                     fclose(f);
                     fin.close();
                     return -1;
@@ -523,7 +752,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
                 int64_t target_offset = funcArray[j].byteOffsetInResolveBin;
                 if (fwrite(&target_offset, sizeof(int64_t),1,f) != 1){
                     
-                    cout << "Error!!! writing patched Call offset "<<endl;
+                    err = "internal error: writing a patched call offset";
                     fclose(f);
                     fin.close();
                     return -1;
@@ -536,15 +765,21 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
         }
 
         if(!found){
-
-            cout << "Error!!!! call to undefined function " << tar_func << endl;
+            
+            err = "call to undefined function '" + tar_func + "'";
             fclose(f);
+            fin.close();
             return -1;
         }
-
     }
 
-    fclose(f);
+
+
+    if (fclose(f) != 0) {
+
+        err = "internal error: couldn't finish writing resolve.bin";
+        return -1;
+    }
 
     for (int32_t j =0; j<funcCount;j++){
         if(funcArray[j].funcName == "main"){
@@ -553,7 +788,7 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath)
         }
     }
 
-    cout << "Error!!! no main function "<<endl;
+    err = "no main function found";
     fin.close();
     return -1;
 
@@ -571,71 +806,87 @@ struct Token
     TokenType type;
     string text;
 };
+
 int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
 {
-    // first word is always a instruction keyword
-    // instruction set = [func, func_end, call, set, add, sub, mul and div]
-    // next word is identifier like name of a function, variable name
-    // after identifier all are the params/arg, space separated
+    if(maxTokens <= 0){
 
+        return 0;
+    }
 
-    int size = line.length();
-    int indx = 0;
-    int ct =0;
+    int32_t size = static_cast<int32_t>(line.length());
+    int32_t indx = 0;
+    int32_t ct = 0;
 
     while(indx < size && is_space(line[indx])){
 
         indx++;
     }
 
-    if (indx >= size){
+    if(indx >= size){
+
         return 0;
     }
+
     string first_word;
-    
+
     while(indx < size && !is_space(line[indx])){
-        first_word += line[indx];
-        indx++;
+
+        first_word += line[indx++];
     }
+
     tokens[ct].text = first_word;
     tokens[ct].type = KEYWORD;
     ct++;
 
     while(indx < size && is_space(line[indx])){
+
         indx++;
     }
 
-    if(indx >= size || ct>= maxTokens){
+    if(indx >= size){
+
+        return ct;
+    }
+
+    if(ct >= maxTokens){
+
         return ct;
     }
 
     string second_word;
-   
+
     while(indx < size && !is_space(line[indx])){
-        second_word += line[indx];
-        indx++;
-       
+
+        second_word += line[indx++];
     }
+
     tokens[ct].text = second_word;
     tokens[ct].type = IDENTIFIER;
     ct++;
 
-   while(indx < size && ct < MAX_TOKENS){
+    while(indx < size){
 
         while(indx < size && is_space(line[indx])){
-           indx++;
+
+            indx++;
         }
 
         if(indx >= size){
+
             break;
         }
 
-        string params ;
+        if(ct >= maxTokens){
 
-        while(indx <size && !is_space(line[indx])){
+            return maxTokens + 1;
+        }
 
-            params += line[indx];
-            indx++;
+        string params;
+
+        while(indx < size && !is_space(line[indx])){
+
+            params += line[indx++];
         }
 
         tokens[ct].text = params;
@@ -644,21 +895,17 @@ int32_t tokenizeLine(const string &line, Token tokens[], int32_t maxTokens)
     }
 
     return ct;
-
 }
+
 Snapshot *buildSnapshot(Stack<Frame> &callStack)
 {
-    // build the snapshot based on the callStack given
-
     Snapshot* snapshot = new Snapshot();
 
-    snapshot->stackDepth = callStack.depth();
-
-    callStack.snapshot_into(snapshot->callStack, MAX_STACK_DEPTH);
+    snapshot->stackDepth = callStack.snapshot_into(snapshot->callStack, MAX_STACK_DEPTH);
 
     return snapshot;
-
 }
+
 
 // helper functions
 
@@ -708,53 +955,118 @@ bool is_num(const string& str){
     return true;
 }
 
-int32_t str_to_num(const string& str){
-  
-    int indx = 0;
+bool str_to_num(const string& str, int32_t& result)
+{
+    if(!is_num(str)){
+
+        return false;
+    }
+
+    int32_t indx = 0;
     bool neg = false;
-    int32_t num = 0;
 
     if(str[0] == '-'){
-       neg = true;
-       indx = 1;
+
+        neg = true;
+        indx = 1;
     }
 
-    int size = str.length();
+    int64_t num = 0;
 
-    while(indx < size ){
-      int dig = str[indx] -'0';
-      num = num* 10 + dig;
-      indx++;
+    while(indx < static_cast<int32_t>(str.length())){
+
+        int32_t dig = str[indx] - '0';
+
+        num = num * 10 + dig;
+
+        if(neg){
+
+            if(num > 2147483648LL)
+            {
+                return false;
+            }
+
+        }else{
+
+            if(num > 2147483647LL){
+
+                return false;
+            }
+        }
+
+        indx++;
     }
 
-    if(neg == true){
-      num = -num;
+    if(neg){
+
+        num = -num;
     }
 
-   return num;
-
+    result = static_cast<int32_t>(num);
+    return true;
 }
-
-bool getting_value(Frame& frame , string& str , int32_t& res){
-
+bool getting_value(Frame& frame, string& str, int32_t& res)
+{
     if(is_num(str)){
-       
-        res = str_to_num(str);
-        return true;
-       
+
+        return str_to_num(str, res);
     }
 
-    Variable* var = find_var(frame , str);
+    Variable* var = find_var(frame, str);
+
     if(var == nullptr){
-        return false; 
+
+        return false;
     }
 
     res = var->value;
     return true;
 }
 
+bool safe_arithmetic(const string& operation, int32_t left, int32_t right, int32_t& result){
+    int64_t value = 0;
 
-void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline)
+    if(operation == "add"){
+
+        value = static_cast<int64_t>(left) + right;
+    }
+    else if(operation == "sub"){
+
+        value = static_cast<int64_t>(left) - right;
+    }
+    else if(operation == "mul"){
+
+        value = static_cast<int64_t>(left) * right;
+    }
+    else if(operation == "div"){
+
+        if(right == 0){
+
+            return false;
+        }
+
+        if(left == INT32_MIN && right == -1){
+
+            return false;
+        }
+
+        value = left / right;
+    }
+    else{
+
+        return false;
+    }
+
+    if(value < INT32_MIN || value > INT32_MAX){
+
+        return false;
+    }
+
+    result = static_cast<int32_t>(value);
+    return true;
+}
+
+bool executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &timeline , string &err)
 {
     // initialize the call stack
     // make the main frame
@@ -763,40 +1075,42 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
     // implementation:
     // execute line by line, and according to the keyword perform action
 
-    FILE* f = fopen(resolveBinPath ,"rb");
+FILE* f = fopen(resolveBinPath ,"rb");
 
-    if(f == nullptr){
+if(f == nullptr){
            
-        cout << "Error!!! Couldn't open file " << resolveBinPath << endl;
-        return; 
-    }
+    err = "internal error: couldn't open resolve.bin";
+    return false; 
+}
     
+try{
+
+        bool ok = true;
     Stack<Frame> call_stack;
     Token Tokens[MAX_TOKENS];
     string Line;
 
     if(fseek(f,mainOffset ,SEEK_SET)!=0){
 
-        cout << "Error!!! Couldn't seek to main funcion "<<endl;
+        err = "internal error: couldn't seek to main";
         fclose(f);
-        return;
+        return false;
     }
 
     int64_t main_offset = readResolveRecord(f,Line);
     if(main_offset == -1){
 
-        cout << "Error!!! Couldn't read main function "<<endl;
+        err = "internal error: couldn't read main";
         fclose(f);
-        return;
+        return false;
     }
 
     int token_ct = tokenizeLine(Line , Tokens ,MAX_TOKENS);
 
-    if(token_ct < 2){
-
-        cout << "Error!!! Invalid main function record" << endl;
+    if(token_ct < 2 || Tokens[0].text != "func"){
+        err = "invalid main function record";
         fclose(f);
-        return;
+        return false;
     }
 
 
@@ -818,11 +1132,20 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
     while(!call_stack.isEmpty()){
 
+        if(timeline.getStepCount() >= MAX_STEPS){
+            
+            err = "program is too long: more than " +
+            to_string(MAX_STEPS) + " steps";
+            ok = false;
+            break;
+        }
+
         int64_t re_ps = ftell(f); // record position
 
         if(re_ps == -1){
 
-            cout << "Error!!! Couldn't determine current file position "<< endl;
+            err = "internal error: couldn't determine the file position";
+            ok = false;
             break;
         }
 
@@ -830,7 +1153,8 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
         
         if(Offset_Field == -1){
 
-            cout << "Error!!! unexpected end of the file "<< endl;
+            err = "unexpected end of program (missing func_end?)";
+            ok = false;
             break;
         }
         
@@ -838,7 +1162,8 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
         if(token_ct <=0){
 
-            cout << "Error!!! Invalid instruction " << Line << endl;
+            err = "invalid instruction: " + Line;
+            ok = false;
             break;
         }
 
@@ -849,9 +1174,10 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
             int32_t val = 0;
 
-            if(token_ct <3 || !getting_value(c_at,Tokens[2].text , val)){
+            if(token_ct != 3 || !getting_value(c_at, Tokens[2].text, val)){
 
-                cout << "Error!!! Setting value " << endl;
+                err = "bad 'set' instruction (missing or undefined value): " + Line;
+                ok = false;
                 break;
             }
 
@@ -861,7 +1187,8 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
                 if(c_at.localCount >= MAX_VARS_PER_FRAME){
                      
-                    cout << " Too many variables in " << c_at.func_name << " function" << endl;
+                    err = "too many variables in function " + c_at.func_name; 
+                    ok = false;
                     break;
                 }
 
@@ -874,55 +1201,52 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
             var->value = val;
 
         }
-        else if( Keyword == "div" || Keyword == "mul" || Keyword == "add" || Keyword == "sub"){
-
-            if(token_ct <3){
-
-                cout << "Error!!! " << Keyword << " reqires 2 operands " << endl;
+        else if(Keyword == "div" || Keyword == "mul" || Keyword == "add" || Keyword == "sub"){
+            if(token_ct != 3){
+                err = Keyword + " requires exactly 2 operands: " + Line;
+                ok = false;
                 break;
             }
-
-            Variable* res = find_var(c_at, Tokens[1].text);
             
-            int32_t op = 0; // operand
+            Variable* res = find_var(c_at, Tokens[1].text);
+            int32_t op = 0;
 
-            if(res == nullptr || !getting_value(c_at ,Tokens[2].text,op)){
-
-                cout << "Error!!! undefined variable in " << Line << endl;
+            if(res == nullptr || !getting_value(c_at, Tokens[2].text, op)){
+                err = "undefined variable in: " + Line;
+                ok = false;
                 break;
             }
-
-            if(Keyword == "div"){
-
-                if(op == 0){
-
-                    cout << "Error!!! (unallowed) division by 0 in "<< Line << endl;
-                    break;
-                }
-
-                res->value = res->value /op;
+            
+            int32_t newValue = 0;
+            if(Keyword == "div" && op == 0){
+                err = "division by zero in: " + Line;
+                ok = false;
+                break;
             }
-            else if(Keyword == "mul"){
-
-                res->value = res->value * op;
+            if(!safe_arithmetic(Keyword, res->value, op, newValue)){
+                err = "arithmetic overflow or invalid operation in: " + Line;
+                ok = false;
+                break;
             }
-            else if(Keyword == "sub"){
-
-                res->value = res->value - op;
-            }
-            else if(Keyword == "add"){
-
-                res->value = res->value + op;
-            }
+            res->value = newValue;
         }
         else if(Keyword == "call"){
 
+            if(token_ct < 2 || token_ct > MAX_TOKENS){
+                err = "invalid call instruction: " + Line;
+                ok = false;
+                break;
+            }
+
             int32_t arg_ct = token_ct - 2;
+            string calledFuncName = Tokens[1].text;
+
             int32_t arg_val[MAX_VARS_PER_FRAME];
 
             if(arg_ct > MAX_VARS_PER_FRAME){
 
-                cout << " Error!!! too many arguments "<< endl;
+                err = "too many arguments in: " + Line; 
+                ok = false;                             
                 break;
             }
 
@@ -932,42 +1256,46 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
                 
                 if(!getting_value(c_at , Tokens[i+2].text,arg_val[i])){
 
-                    cout << "Error!!! " << Tokens[i+2].text << " is not defined" << endl;
+                     err = "'" + Tokens[i + 2].text + "' is not defined in: " + Line;
                     g_val = false;
                     break;
                 }
             }
 
             if(g_val == false){
+
+                ok = false;
                 break;
             }
 
             if(fseek(f,Offset_Field,SEEK_SET)!= 0){
 
-                cout << "Error!!! Couldn't seek to called function " << endl;
+                err = "internal error: couldn't seek to the called function"; 
+                ok = false;                                                    
                 break;
             }
 
             if(readResolveRecord(f, Line) == -1){
 
-                cout << "Error!!! Couldn't read called function "<<endl;
+                err = "internal error: couldn't read the called function"; 
+                ok = false;                                                 
                 break;
             }
 
             int hdr_ct = tokenizeLine(Line , Tokens , MAX_TOKENS); // header count
 
-            if(hdr_ct < 2){
-
-                cout << "Error!!! Invalid function header " <<endl;
+            if(hdr_ct < 2 || Tokens[0].text != "func" || Tokens[1].text != calledFuncName){
+                err = "invalid called function header";
+                ok = false;
                 break;
-
             }
 
             int par_ct = hdr_ct - 2; // parameter counter
 
             if(par_ct != arg_ct){
 
-                cout << "Error!!! " << Tokens[1].text << " needs " << par_ct  << " arguments but it got " << arg_ct << endl;
+                err = "function " + Tokens[1].text + " needs " + to_string(par_ct) + " arguments but got " + to_string(arg_ct); 
+                ok = false;                                                                                                       
                 break;
             }
 
@@ -985,7 +1313,8 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
             
             if(call_stack.depth() >=MAX_STACK_DEPTH){
 
-                cout << " ERROR!!! STACK IS FULL " << endl;
+                err = "stack overflow: calls are nested more than " + to_string(MAX_STACK_DEPTH) + " deep"; 
+                ok = false;                                                                                  
                 break;
             }
 
@@ -1000,13 +1329,15 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
                 if(fseek(f,completed.returnLine , SEEK_SET) != 0){
                     
-                    cout << "Error!!! Couldn't return to caller " << endl;
+                    err = "internal error: couldn't return to the caller"; 
+                    ok = false;                                          
                     break;
                 }
 
                 if(readResolveRecord(f,Line) == -1){
 
-                    cout << "Error!!! Couldn't read caller instructions "<< endl;
+                    err = "internal error: couldn't read the caller instruction"; 
+                    ok = false;                                                   
                     break;
                 }
 
@@ -1014,13 +1345,15 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
                 if(caller_token_ct < completed.argc + 2){
 
-                   cout << "Error!!! Invalid caller instructions "<< endl;
+                    err = "invalid caller instruction"; 
+                    ok = false;                         
                     break;
                 }
 
                 if(call_stack.isEmpty()){
 
-                    cout << "Error!!! No caller frame exists "<< endl;
+                    err = "internal error: no caller frame exists"; 
+                    ok = false;                                   
                     break;
                 }
 
@@ -1040,15 +1373,23 @@ void executeProgram(const char *resolveBinPath, int64_t mainOffset, Timeline &ti
 
         }else{
 
-            cout << "Unknown Instructions " << Line << endl;
+            err = "unknown instruction: " + Line; 
+            ok = false;                          
             break;
         }
+
+ 
         timeline.record(buildSnapshot(call_stack));
 
     }
 
     fclose(f);
-
+    return ok;
+}
+catch (...) {
+    fclose(f);
+    throw;
+}
 }
 
 void showing_timeline(Timeline& t){
@@ -1097,24 +1438,28 @@ void showing_timeline(Timeline& t){
 
 // PASS 0x3: SERIALIZE TIMELINE
 
-bool write_str(FILE* f , const string& str){
+bool write_str(FILE* f, const string& str)
+{
+    if(str.size() > static_cast<size_t>(INT32_MAX)){
 
-    int32_t len = static_cast<int32_t>(str.size());
-
-    if(fwrite(&len , sizeof(int32_t) , 1,f)!= 1){
-
-       cout << "Error!!! while writing " << endl;
         return false;
     }
 
-    if(len > 0 && fwrite(str.data(), 1,len ,f)!= static_cast<size_t>(len)){
+    int32_t len = static_cast<int32_t>(str.size());
 
-        cout << "Error!!! while writing "<< endl;
+    if(fwrite(&len, sizeof(int32_t), 1, f) != 1){
+
+        return false;
+    }
+
+    if(len > 0 && fwrite(str.data(), 1, len, f) != static_cast<size_t>(len)){
+      
         return false;
     }
 
     return true;
 }
+
 
 bool write_variable(FILE* f , const Variable& var){
 
@@ -1215,34 +1560,27 @@ bool write_snapshot(FILE* f , const Snapshot& snapshot){
     return true;
 }
 
-
-
-void writeTdbg(Timeline &timeline, const char *tdbgPath)
+bool writeTdbg(Timeline &timeline, const char *tdbgPath, string &err)
 {
-    // placeholder for header
-    // index array of the size of stepcount from the timeline
-    // placing each snapshot in the file while maintaining the index(starting point of each nth snapshot)
-    // after timeline add the index array i the file
-    // update the header
-
-    FILE* f = fopen(tdbgPath ,"wb");
+    FILE* f = fopen(tdbgPath, "wb");
 
     if(f == nullptr){
 
-        cout << "Error!!! Couldn't open the file "<< endl;
-        return;
+        err = "server couldn't create session.tdbg";
+        return false;
     }
 
-    int32_t stepCount = timeline.getStepCount();
-
-    int64_t* indx = nullptr;
-
-    if(stepCount > 0){
-
-        indx = new int64_t[stepCount];
-    }
+    bool ok = true;
 
     try{
+        int32_t stepCount = timeline.getStepCount();
+
+        if(stepCount < 0 || stepCount > MAX_STEPS) {
+
+            throw runtime_error("Invalid timeline step count");
+        }
+
+        vector<int64_t> indx(stepCount);
 
         TTDBHeader header;
 
@@ -1255,7 +1593,7 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
         header.stepCount = stepCount;
         header.indexOffset = 0;
 
-        writeHeader(f , header);
+        writeHeader(f, header);
 
         TimelineNode* current = nullptr;
 
@@ -1271,12 +1609,13 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
             long position = ftell(f);
 
             if(position == -1){
-                throw runtime_error("Couldn't determine snapshot file offset ");
+
+                throw runtime_error("Couldn't determine snapshot file offset");
             }
 
             indx[step] = static_cast<int64_t>(position);
 
-            if(current->data == nullptr || !write_snapshot(f , *current->data)){
+            if(current->data == nullptr || !write_snapshot(f, *current->data)){
 
                 throw runtime_error("Failed to write snapshot");
             }
@@ -1285,74 +1624,392 @@ void writeTdbg(Timeline &timeline, const char *tdbgPath)
             step++;
         }
 
-        if(step != stepCount){
+        if(step != stepCount || current != nullptr){
 
-            throw runtime_error("Timeline node count doesn't match step count ");
+            throw runtime_error("Timeline node count doesn't match step count");
         }
 
         long indx_position = ftell(f);
 
         if(indx_position == -1){
 
-            throw runtime_error("Couldn't determine index offset ");
+            throw runtime_error("Couldn't determine index offset");
         }
 
         header.indexOffset = static_cast<int64_t>(indx_position);
 
-        for (int32_t i = 0; i < stepCount ;i++ ){
-            
-            if(fwrite(&indx[i] , sizeof(int64_t),1,f)!= 1){
+        for(int32_t i = 0; i < stepCount; i++){
 
-                throw runtime_error("Failed to write dense index ");
+            if(fwrite(&indx[i], sizeof(int64_t), 1, f) != 1){
+
+                throw runtime_error("Failed to write dense index");
             }
-
         }
 
-        if(fseek(f ,0 , SEEK_SET) != 0){
+        if(fseek(f, 0, SEEK_SET) != 0){
 
-            throw runtime_error("Couldn't seek to header ");
+            throw runtime_error("Couldn't seek to header");
         }
 
-        writeHeader(f , header);
+        writeHeader(f, header);
 
-        if(ferror(f)){
-            throw runtime_error("File write error");
+        if(fflush(f) != 0 || ferror(f)){
+
+            throw runtime_error("File write or flush error");
         }
-
-        cout << "Successfully created " << tdbgPath << endl;
-       
     }
     catch(const exception& e){
-        
-        cout << "Error!!! Serialization failed: " << e.what() << endl;
+
+        err = string("serialization failed: ") + e.what();
+        ok = false;
     }
 
-   delete[] indx;
-   fclose(f);
+    if(fclose(f) != 0 && ok){
+
+        err = "serialization failed: couldn't close session.tdbg";
+        ok = false;
+    }
+
+    if(!ok){
+
+        remove(tdbgPath);
+        return false;
+    }
+
+    cout << "Successfully created " << tdbgPath << endl;
+    return true;
+}
+
+
+volatile sig_atomic_t running = 1;
+void onSignal(int sg)
+{
+    (void)sg;
+    running = 0;
+}
+ 
+int createServerListenSocket(int port)
+{
+    int sock = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if(sock < 0){
+
+        perror("socket");
+        exit(1);
+    }
+
+    int yes = 1;
+
+    if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0){
+
+        perror("setsockopt SO_REUSEADDR");
+        close(sock);
+        exit(1);
+    }
+
+    sockaddr_in addr{};
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+
+    if(bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0){
+
+        perror("bind");
+        close(sock);
+        exit(1);
+    }
+
+    if(listen(sock, SERVER_BACKLOG) < 0){
+
+        perror("listen");
+        close(sock);
+        exit(1);
+    }
+
+    return sock;
+}
+bool receiveSource(int sock, const char *path, string &err)
+{
+    char status;
+    
+    if (!recvAll(sock, &status, 1)){
+
+        err = "upload failed: nothing received";
+        return false;
+    }
+
+    if (status != 0){
+
+        err = "upload failed: unexpected status byte";
+        return false;
+    }
+ 
+    TrailerChecker checker(status);
+ 
+    FILE *f = fopen(path, "wb");
+    
+    if (f == nullptr){
+
+        err = "server couldn't create source.bin";
+        return false;
+    }
+ 
+    vector<char> buf(IO_BUFFER_SIZE);
+    vector<char> body(IO_BUFFER_SIZE);
+    uint64_t written = 0;
+    bool tooBig = false;
+    string failure;
+ 
+    while (true){
+
+        ssize_t r = recv(sock, buf.data(), buf.size(), 0);
+        
+        if (r < 0){
+
+            if (errno == EINTR){
+
+                continue;
+            }
+
+            else if (errno == EAGAIN || errno == EWOULDBLOCK){
+
+                failure = "upload timed out";
+            }
+
+            else{
+
+                failure = "connection error during upload";
+            }
+
+            break;
+        }
+
+        if (r == 0){
+
+            break; 
+        }
+ 
+        size_t released = checker.feed(buf.data(), static_cast<size_t>(r), body.data());
+ 
+        if (!tooBig){
+
+            written += released;
+            if (written > MAX_SOURCE_BYTES){
+
+                tooBig = true; 
+            }
+
+            else if (released > 0 && fwrite(body.data(), 1, released, f) != released){
+
+                failure = "server couldn't write source.bin";
+                break;
+            }
+        }
+    }
+ 
+    if (fclose(f) != 0 && failure.empty()){
+
+        failure = "server couldn't save source.bin";
+    }
+ 
+    if (!failure.empty()){
+
+        remove(path);
+        err = failure;
+        return false;
+    }
+
+    if (tooBig){
+
+        remove(path);
+        err = "source file is too large (limit " + to_string(MAX_SOURCE_BYTES / (1024 * 1024)) + " MB)";
+        return false;
+    }
+
+    if (!checker.verify()){
+
+        remove(path);
+        err = "upload checksum mismatch";
+        return false;
+    }
+
+    return true;
+}
+
+
+
+
+bool sendTdbgReply(int sock, const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == nullptr){
+
+        sendError(sock, "server couldn't read session.tdbg");
+        return false;
+    }
+ 
+    Crc32 crc;
+    char status = 0;
+    crc.update(&status, 1);
+    bool ok = sendAll(sock, &status, 1);
+ 
+    vector<char> buf(IO_BUFFER_SIZE);
+    while (ok){
+
+        size_t got = fread(buf.data(), 1, buf.size(), f);
+        if (got > 0){
+
+            crc.update(buf.data(), got);
+            ok = sendAll(sock, buf.data(), got);
+        }
+
+        if (got < buf.size()){
+
+            if (ferror(f)){
+
+                ok = false;
+            }
+
+            break;
+        }
+    }
+    fclose(f);
+ 
+    if (ok){
+
+        char tail[4];
+        write_u32(tail, crc.value());
+        ok = sendAll(sock, tail, 4);
+    }
+    return ok;
+}
+
+void handleClient(int sock)
+{
+    timeval tv{};
+    tv.tv_sec = SOCKET_TIMEOUT_SEC; 
+    tv.tv_usec = 0;
+    
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0){
+
+        perror("setsockopt SO_RCVTIMEO");
+        return;
+    }
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0){
+
+        perror("setsockopt SO_SNDTIMEO");
+        return;
+    }
+   
+ 
+    string err;
+    try {
+        if (!receiveSource(sock, "source.bin", err)){
+            cout << "[server] rejected: " << err << endl;
+            sendError(sock, err);
+            return;
+        }
+ 
+        if (!validateProgram("source.bin", err)){
+
+           cout << "[server] rejected: " << err << endl;
+           sendError(sock, err);
+           return;
+        }
+        int64_t mainOffset = resolveProgram("source.bin", "resolve.bin", err);
+        if (mainOffset == -1){
+            cout << "[server] rejected: " << err << endl;
+            sendError(sock, err);
+            return;
+        }
+        Timeline timeline;
+        if (!executeProgram("resolve.bin", mainOffset, timeline, err)){
+            cout << "[server] rejected: " << err << endl;
+             sendError(sock, err);
+             return;
+            }
+            
+        if (!writeTdbg(timeline, "session.tdbg", err)){
+            
+            cout << "[server] rejected: " << err << endl;
+            sendError(sock, err);
+            return;
+        }
+        
+        if (!sendTdbgReply(sock, "session.tdbg")){
+            cout << "[server] couldn't deliver the reply" << endl;
+        }
+    }
+    catch (const bad_alloc&) {
+        cout << "[server] out of memory" << endl;
+        sendError(sock, "server ran out of memory (program too large)");
+    }
+    catch (const exception& e) {
+        cout << "[server] internal error: " << e.what() << endl;
+        sendError(sock, string("server internal error: ") + e.what());
+    }
 
 }
+
 // main section
 
-int32_t main()
+int main(int argc, char *argv[])
 {
+    int port = DEFAULT_PORT;
+    if (argc >= 2){
 
-    if (!validateProgram("source.bin"))
-    {
-                 // send an error response instead of a .tdbg file
-       return 1;
+        char *end = nullptr;
+        long v = strtol(argv[1], &end, 10);
+        if (end == argv[1] || *end != '\0' || v < 1 || v > 65535){
+
+            cout << "Usage: " << argv[0] << " <port>" << endl;
+            return 1;
+        }
+        port = static_cast<int>(v);
     }
+ 
+    struct sigaction sa{};
+    sa.sa_handler = onSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
+ 
+    int listenSock = createServerListenSocket(port);
+    cout << "[server] listening on port " << port << endl;
+ 
+    while (running){
 
-    int64_t mainOffset = resolveProgram("source.bin", "resolve.bin");
+        int cs = accept(listenSock, nullptr, nullptr);
+        if (cs < 0){
 
-    if (mainOffset == -1){
-        // throw error 
-        return 1;
+            if (errno == EINTR){
+
+                continue;
+            }
+            perror("accept");
+            break;
+        }
+ 
+        try{
+            handleClient(cs);
+        }
+        catch(const exception& e){
+            cerr << "[server] unexpected error: " << e.what() << endl;
+        }
+        catch(...){
+            cerr << "[server] unknown unexpected error" << endl;
+        }
+        close(cs);
+        remove("source.bin");
+        remove("resolve.bin");
+        remove("session.tdbg");
     }
-   Timeline timeline;
-    executeProgram("resolve.bin", mainOffset, timeline);
-
-    writeTdbg(timeline, "session.tdbg");
-
+ 
+    close(listenSock);
+    cout << "[server] bye" << endl;
     return 0;
 }
-
+ 

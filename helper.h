@@ -6,7 +6,7 @@
 #include<sys/socket.h>
 using namespace std;
 
-
+const int MAX_NAME_LENGTH = 4096;
 const int IO_BUFFER_SIZE = 64 * 1024;
 const int MAX_VARS_PER_FRAME = 16;
 const int MAX_STACK_DEPTH = 64;
@@ -161,6 +161,17 @@ inline uint32_t read_u32(const char* in){
   return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
 
 
+}
+inline bool sendError(int sock, const string &message){
+    char status = 1;
+    Crc32 crc;
+    crc.update(&status, 1);
+    crc.update(message.data(), message.size());
+    if(!sendAll(sock, &status, 1)) return false;
+    if(!sendAll(sock, message.data(), message.size())) return false;
+    char tail[4];
+    write_u32(tail, crc.value());
+    return sendAll(sock, tail, 4);
 }
 
 class TrailerChecker { 
