@@ -265,8 +265,8 @@ bool receiveResponse(int sock, const char *outTdbgPath, string &outError)
         return false;
     }
 
-    return true;git add helper.h server.cpp client.cpp load_balancer.cpp
-
+    return true;
+    
 }
 bool requestDebugFile(const string &host , int port , const string &sourcePath , const char *outTdbgPath , string &outError){
 
