@@ -1,4 +1,8 @@
 server
-resolve.bin
+load_balancer
+client
+*.o
+*.bin
 *.tdbg
-server
+*.tdbg.*
+ttdb_server_*
