@@ -73,7 +73,7 @@ public:
 
     void push(const T &val)
     {
-        if(count == MAX_STACK_DEPTH){
+        if(count >= MAX_STACK_DEPTH){
       
             throw overflow_error("Stack is full");
         }
@@ -726,16 +726,6 @@ int64_t resolveProgram(const char *sourcePath, const char *resolveBinPath , stri
 
             if(func_name == ""){
     
-                for(int32_t j = 0; j < funcCount; j++){
-    
-                    if(funcArray[j].funcName == func_name){
-    
-                        err = "duplicate function definition: " + func_name;
-                        fclose(f);
-                        return -1;
-                    }
-                }
-
                 err = "call instruction without a function name";
                 fclose(f);
                 return -1;
